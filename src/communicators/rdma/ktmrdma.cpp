@@ -266,6 +266,7 @@ void ktm_client_exchange_rdma_info(struct rdma_cm_id *id, void *addr, size_t len
 }
 
 void ktm_server_exchange_rdma_info(struct rdma_cm_id *id, void *addr, size_t length, struct ibv_mr *mr, uintptr_t * remote_addr, uint32_t * remote_rkey, struct ibv_mr *rdma_mr) {
+
     uintptr_t received_addr = ktm_rdma_get_address(id, addr, length, mr);
     memcpy(remote_addr, &received_addr, sizeof(uintptr_t));
 
@@ -275,4 +276,53 @@ void ktm_server_exchange_rdma_info(struct rdma_cm_id *id, void *addr, size_t len
     memcpy(remote_rkey, &received_rkey, sizeof(uint32_t));
 
     ktm_rdma_send_rkey(id, addr, length, mr, rdma_mr);
+}
+
+void ktm_rdma_post_send_inline(struct rdma_cm_id *id,
+                               void *context,
+                               const void *addr,
+                               size_t length,
+                               int flags) {
+    // 1) 查询 QP 的 inline 能力，确保长度不超过 max_inline_data
+    ibv_qp_attr attr;
+    ibv_qp_init_attr init_attr;
+    memset(&attr, 0, sizeof(attr));
+    memset(&init_attr, 0, sizeof(init_attr));
+
+    int qrc = ibv_query_qp(id->qp, &attr, IBV_QP_CAP, &init_attr);
+    if (qrc) {
+        // 注意：ibv_query_qp 返回非 0 的错误码，不一定设置 errno
+        throw std::string("ibv_query_qp(): error: rc=") + std::to_string(qrc);
+    }
+
+    uint32_t max_inline = init_attr.cap.max_inline_data;
+    if (length > max_inline) {
+        throw std::string("ktm_rdma_post_send_inline(): error: length ")
+              + std::to_string(length)
+              + " exceeds max_inline_data "
+              + std::to_string(max_inline);
+    }
+
+    // 2) 构造 SGE（inline 会忽略 lkey）
+    ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+    sge.addr   = reinterpret_cast<uintptr_t>(addr);
+    sge.length = static_cast<uint32_t>(length);
+    sge.lkey   = 0; // inline 情况下由 HCA 从 WQE 取数据，lkey 不使用
+
+    // 3) 构造 WR，强制加 IBV_SEND_INLINE
+    ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id      = reinterpret_cast<uint64_t>(context);
+    wr.sg_list    = (length > 0) ? &sge : nullptr;
+    wr.num_sge    = (length > 0) ? 1 : 0;
+    wr.opcode     = IBV_WR_SEND;
+    wr.send_flags = flags | IBV_SEND_INLINE; // 允许调用方继续传 IBV_SEND_SIGNALED 等
+
+    ibv_send_wr *bad = nullptr;
+    int rc = ibv_post_send(id->qp, &wr, &bad);
+    if (rc) {
+        // ibv_post_send 返回非 0 的错误码（不是通过 errno）
+        throw std::string("ibv_post_send(INLINE): error: rc=") + std::to_string(rc);
+    }
 }

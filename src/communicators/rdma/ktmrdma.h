@@ -227,5 +227,11 @@ void ktm_server_exchange_rdma_info(struct rdma_cm_id *id, void *addr, size_t len
 
 void ktm_server_exchange_rdma_info(struct rdma_cm_id *id, void *addr, size_t length, struct ibv_mr *mr, uintptr_t * remote_addr, uint32_t * remote_rkey, struct ibv_mr *rdma_mr);
 
+// send inline, dont need mr.
+void ktm_rdma_post_send_inline(struct rdma_cm_id *id,
+                               void *context,
+                               const void *addr,
+                               size_t length,
+                               int flags);
 
 #endif //RDMACM_KTMRDMA_H

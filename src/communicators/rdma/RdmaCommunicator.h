@@ -26,16 +26,16 @@ namespace gvirtus::communicators {
         rdma_cm_id * rdmaCmListenId;
 
         char hostname[256];
-        char port[6];
+        char port[6]; // enough for "65535" + '\0'
 
         ibv_wc workCompletion;
 
         ibv_mr * memoryRegion;
 
-        char preregisteredBuffer[1024 * 5];
-        ibv_mr * preregisteredMr;
-        
         bool isRoce = false;
+
+        // Actual inline capability (bytes) of the QP, queried after creation.
+        uint32_t maxInlineData_ = 0;
 
     public:
         RdmaCommunicator() = default;
