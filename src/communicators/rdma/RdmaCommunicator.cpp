@@ -16,41 +16,13 @@
 
 using gvirtus::communicators::RdmaCommunicator;
 
-// ---------- Internal helpers (private) ----------------------------------------
+// ---------- Helper ------------------------------------------------------------
 
-/**
- * @brief Query QP capability once and cache max_inline_data.
- *        Looks at init_attr.cap.max_inline_data primarily, then attr.cap as fallback.
- */
-void RdmaCommunicator::cache_max_inline_() {
-    if (!rdmaCmId || !rdmaCmId->qp)
-        throw std::runtime_error("cache_max_inline_(): no QP available");
-
-    ibv_qp_attr attr{};
-    ibv_qp_init_attr init_attr{};
-    int rc = ibv_query_qp(rdmaCmId->qp, &attr, IBV_QP_CAP, &init_attr);
-    if (rc) {
-        throw std::runtime_error("ibv_query_qp(IBV_QP_CAP) failed, rc=" + std::to_string(rc));
-    }
-
-    uint32_t from_init = init_attr.cap.max_inline_data;
-    uint32_t from_attr = attr.cap.max_inline_data;
-    max_inline_data = from_init ? from_init : from_attr;
-
-#ifdef DEBUG
-    std::cout << "Cached max_inline_data = " << max_inline_data << " bytes" << std::endl;
-#endif
-}
-
-/**
- * @brief Best-effort min_rnr_timer tweak (safe no-op if it fails).
- */
 void RdmaCommunicator::request_min_rnr_timer_(uint8_t v) {
     if (!rdmaCmId || !rdmaCmId->qp) return;
     ibv_qp_attr qp_attr{};
     qp_attr.min_rnr_timer = v;
     if (ibv_modify_qp(rdmaCmId->qp, &qp_attr, IBV_QP_MIN_RNR_TIMER)) {
-        // Non-fatal; keep running.
 #ifdef DEBUG
         std::perror("ibv_modify_qp(IBV_QP_MIN_RNR_TIMER)");
 #endif
@@ -59,60 +31,51 @@ void RdmaCommunicator::request_min_rnr_timer_(uint8_t v) {
 
 // ---------- Constructors / Destructor -----------------------------------------
 
-RdmaCommunicator::RdmaCommunicator(const std::string& host, const std::string& prt, bool roce)
-    : isRoce(roce) {
+RdmaCommunicator::RdmaCommunicator(const std::string& hostname, const std::string& port, bool isRoce)
+    : isRoce(isRoce) {
 #ifdef DEBUG
-    std::cout << "Called RdmaCommunicator(" << host << ", " << prt << ", isRoce=" << isRoce << ")" << std::endl;
+    std::cout << "Called RdmaCommunicator(" << hostname << ", " << port << ", isRoce=" << isRoce << ")\n";
 #endif
-    if (prt.empty()) {
-        throw std::runtime_error("RdmaCommunicator: Port not specified...");
-    }
 
-    hostent *ent = gethostbyname(host.c_str());
+    if (port.empty()) throw std::runtime_error("RdmaCommunicator: Port not specified...");
+
+    hostent *ent = gethostbyname(hostname.c_str());
     if (ent == nullptr) {
         std::ostringstream oss;
-        oss << "RdmaCommunicator: Can't resolve hostname \"" << host << "\"...";
+        oss << "RdmaCommunicator: Can't resolve hostname \"" << hostname << "\"...";
         throw std::runtime_error(oss.str());
     }
 
-    std::strncpy(this->hostname, host.c_str(), sizeof(this->hostname) - 1);
-    std::strncpy(this->port,     prt.c_str(),  sizeof(this->port) - 1);
+    std::strncpy(this->hostname, hostname.c_str(), sizeof(this->hostname) - 1);
+    std::strncpy(this->port,     port.c_str(),     sizeof(this->port) - 1);
 
     rdmaCmId = nullptr;
     rdmaCmListenId = nullptr;
     memoryRegion = nullptr;
     preregisteredMr = nullptr;
-    max_inline_data = 0;
+    inline_enabled = true;
 }
 
-RdmaCommunicator::RdmaCommunicator(rdma_cm_id *id)
+// Constructor used on the server side when a connection is accepted
+RdmaCommunicator::RdmaCommunicator(rdma_cm_id *rdmaCmId)
     : isRoce(false) {
 #ifdef DEBUG
-    std::cout << "Called RdmaCommunicator(rdma_cm_id *rdmaCmId)" << std::endl;
+    std::cout << "Called RdmaCommunicator(rdma_cm_id *rdmaCmId)\n";
 #endif
-    if (!id || !id->qp) throw std::runtime_error("RdmaCommunicator: accepted id or QP is null");
-    rdmaCmId = id;
+    if (!rdmaCmId || !rdmaCmId->qp) throw std::runtime_error("Accepted rdma_cm_id is null or has no QP");
+    this->rdmaCmId = rdmaCmId;
 
-    // Cache inline capability for this QP and pre-register the small bounce buffer.
-    cache_max_inline_();
+    // Pre-register small bounce buffer
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
+    inline_enabled = true; // optimistic: we requested inline capability at QP creation
 }
 
 RdmaCommunicator::~RdmaCommunicator() {
 #ifdef DEBUG
-    std::cout << "Called ~RdmaCommunicator()" << std::endl;
+    std::cout << "Called ~RdmaCommunicator()\n";
 #endif
-    // Deregister MRs if present
-    if (preregisteredMr) {
-        ibv_dereg_mr(preregisteredMr);
-        preregisteredMr = nullptr;
-    }
-    if (memoryRegion) {
-        ibv_dereg_mr(memoryRegion);
-        memoryRegion = nullptr;
-    }
-
-    // Best-effort disconnect and destroy IDs
+    if (preregisteredMr) { ibv_dereg_mr(preregisteredMr); preregisteredMr = nullptr; }
+    if (memoryRegion)    { ibv_dereg_mr(memoryRegion);    memoryRegion    = nullptr; }
     if (rdmaCmId) {
         rdma_disconnect(rdmaCmId);
         rdma_destroy_id(rdmaCmId);
@@ -128,10 +91,10 @@ RdmaCommunicator::~RdmaCommunicator() {
 
 void RdmaCommunicator::Serve() {
 #ifdef DEBUG
-    std::cout << "Called Serve()" << std::endl;
+    std::cout << "Called Serve()\n";
 #endif
+
     rdma_addrinfo hints{};
-    // Select RDMA port space depending on isRoce flag
     hints.ai_port_space = isRoce ? RDMA_PS_TCP : RDMA_PS_IB;
     hints.ai_flags = RAI_PASSIVE;
 
@@ -143,7 +106,7 @@ void RdmaCommunicator::Serve() {
     qpInitAttr.cap.max_recv_wr      = 256;
     qpInitAttr.cap.max_send_sge     = 4;
     qpInitAttr.cap.max_recv_sge     = 4;
-    qpInitAttr.cap.max_inline_data  = 120; // request some inline capability up front
+    qpInitAttr.cap.max_inline_data  = 120; // request some inline capability (cheap, control-path)
     qpInitAttr.sq_sig_all           = 1;
     qpInitAttr.qp_type              = IBV_QPT_RC;
 
@@ -155,13 +118,13 @@ void RdmaCommunicator::Serve() {
 
 const gvirtus::communicators::Communicator *const RdmaCommunicator::Accept() const {
 #ifdef DEBUG
-    std::cout << "Called Accept()" << std::endl;
+    std::cout << "Called Accept()\n";
 #endif
     rdma_cm_id *clientRdmaCmId = nullptr;
     ktm_rdma_get_request(rdmaCmListenId, &clientRdmaCmId);
     ktm_rdma_accept(clientRdmaCmId, nullptr);
 
-    // Best-effort min_rnr tweak on the accepted QP (not critical)
+    // Best-effort RNR tweak (optional)
     auto *ibvQpAttr = static_cast<ibv_qp_attr *>(std::malloc(sizeof(ibv_qp_attr)));
     if (ibvQpAttr) {
         std::memset(ibvQpAttr, 0, sizeof(*ibvQpAttr));
@@ -172,8 +135,6 @@ const gvirtus::communicators::Communicator *const RdmaCommunicator::Accept() con
         std::free(ibvQpAttr);
     }
 
-    // Build a new communicator bound to this accepted connection.
-    // Its constructor will cache inline capability and preregister the small buffer.
     return new RdmaCommunicator(clientRdmaCmId);
 }
 
@@ -181,10 +142,10 @@ const gvirtus::communicators::Communicator *const RdmaCommunicator::Accept() con
 
 void RdmaCommunicator::Connect() {
 #ifdef DEBUG
-    std::cout << "Called Connect()" << std::endl;
+    std::cout << "Called Connect()\n";
 #endif
+
     rdma_addrinfo hints{};
-    std::memset(&hints, 0, sizeof(hints));
     hints.ai_family    = AF_INET;
     hints.ai_port_space= isRoce ? RDMA_PS_TCP : RDMA_PS_IB;
 
@@ -196,7 +157,7 @@ void RdmaCommunicator::Connect() {
     qpInitAttr.cap.max_recv_wr      = 256;
     qpInitAttr.cap.max_send_sge     = 4;
     qpInitAttr.cap.max_recv_sge     = 4;
-    qpInitAttr.cap.max_inline_data  = 120; // request inline capability
+    qpInitAttr.cap.max_inline_data  = 120; // request inline capability; we won't query the actual limit
     qpInitAttr.sq_sig_all           = 1;
     qpInitAttr.qp_type              = IBV_QPT_RC;
 
@@ -205,12 +166,11 @@ void RdmaCommunicator::Connect() {
 
     ktm_rdma_connect(rdmaCmId, nullptr);
 
-    // Optional tuning
     request_min_rnr_timer_(1);
 
-    // Cache inline capability and preregister the bounce buffer once.
-    cache_max_inline_();
+    // Pre-register the small bounce buffer once
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
+    inline_enabled = true; // optimistic enabling; will auto-disable on first failure
 }
 
 // ---------- Data plane ---------------------------------------------------------
@@ -219,13 +179,11 @@ size_t RdmaCommunicator::Read(char *buffer, size_t size) {
 #ifdef DEBUG
     std::cout << "Called Read(char *buffer, size_t size) - Size: " << size << std::endl;
 #endif
-    bool used_temp_mr = false;
 
+    bool used_temp_mr = false;
     if (size < kSmallThreshold) {
-        // Post RECV into our pre-registered bounce buffer
         ktm_rdma_post_recv(rdmaCmId, nullptr, preregisteredBuffer, size, preregisteredMr);
     } else {
-        // Register user buffer for large receive (one-shot)
         memoryRegion = ktm_rdma_reg_msgs(rdmaCmId, buffer, size);
         used_temp_mr = true;
         ktm_rdma_post_recv(rdmaCmId, nullptr, buffer, size, memoryRegion);
@@ -240,7 +198,6 @@ size_t RdmaCommunicator::Read(char *buffer, size_t size) {
     if (size < kSmallThreshold) {
         std::memcpy(buffer, preregisteredBuffer, size);
     } else if (used_temp_mr) {
-        // Deregister the one-shot MR after completion
         ibv_dereg_mr(memoryRegion);
         memoryRegion = nullptr;
     }
@@ -252,17 +209,18 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
 #ifdef DEBUG
     std::cout << "Called Write(const char *buffer, size_t size) - Size: " << size << std::endl;
 #endif
-    // 1) Fast path: INLINE if supported and length fits.
-    if (max_inline_data > 0 && size <= max_inline_data) {
-        ibv_sge sge{}; // will be ignored by HCA for INLINE, but many providers still expect it if length>0
+
+    // 1) Try INLINE if enabled and payload fits the magic threshold.
+    if (inline_enabled && size <= kInlineMagicBytes) {
+        ibv_sge sge{};
         if (size > 0) {
             sge.addr   = reinterpret_cast<uintptr_t>(buffer);
             sge.length = static_cast<uint32_t>(size);
-            sge.lkey   = 0; // not used for INLINE
+            sge.lkey   = 0; // ignored for INLINE
         }
 
         ibv_send_wr wr{};
-        wr.wr_id      = 0; // caller context not used here; adapt if you need it in CQE
+        wr.wr_id      = 0;
         wr.next       = nullptr;
         wr.sg_list    = (size > 0) ? &sge : nullptr;
         wr.num_sge    = (size > 0) ? 1 : 0;
@@ -271,24 +229,28 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
 
         ibv_send_wr *bad = nullptr;
         int rc = ibv_post_send(rdmaCmId->qp, &wr, &bad);
-        if (rc) {
-            throw std::runtime_error("ibv_post_send(INLINE) rc=" + std::to_string(rc));
+        if (rc == 0) {
+            int num_comp;
+            do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
+            if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, inline) failed");
+            if (workCompletion.status != IBV_WC_SUCCESS)
+                throw std::runtime_error(std::string("SEND (inline) failed status ") + ibv_wc_status_str(workCompletion.status));
+            return size;
+        } else {
+            // Provider rejected INLINE (e.g., no support or too small limit) — permanently disable and fall through.
+#ifdef DEBUG
+            std::cerr << "INLINE post rejected (rc=" << rc << "). Disabling inline path.\n";
+#endif
+            inline_enabled = false;
+            // fall through to non-inline path for this send
         }
-
-        int num_comp;
-        do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
-        if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, inline) failed");
-        if (workCompletion.status != IBV_WC_SUCCESS)
-            throw std::runtime_error(std::string("SEND (inline) failed status ") + ibv_wc_status_str(workCompletion.status));
-
-        return size;
     }
 
-    // 2) Otherwise: use pre-registered bounce buffer for small non-inline,
-    //    or register-on-the-fly for large payloads.
+    // 2) Non-inline paths: preregistered bounce buffer for small, register-on-the-fly for large.
     if (size < kSmallThreshold) {
         std::memcpy(preregisteredBuffer, buffer, size);
         ktm_rdma_post_send(rdmaCmId, nullptr, preregisteredBuffer, size, preregisteredMr, IBV_SEND_SIGNALED);
+
         int num_comp;
         do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
         if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, small) failed");
@@ -296,7 +258,6 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
             throw std::runtime_error(std::string("SEND (small) failed status ") + ibv_wc_status_str(workCompletion.status));
         return size;
     } else {
-        // Large send: register and post directly from the caller buffer (avoids extra copy)
         ibv_mr *mr = ktm_rdma_reg_msgs(rdmaCmId, const_cast<char*>(buffer), size);
         ktm_rdma_post_send(rdmaCmId, nullptr, const_cast<char*>(buffer), size, mr, IBV_SEND_SIGNALED);
 
@@ -307,7 +268,6 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
             ibv_dereg_mr(mr);
             throw std::runtime_error(std::string("SEND (large) failed status ") + ibv_wc_status_str(workCompletion.status));
         }
-
         ibv_dereg_mr(mr);
         return size;
     }
@@ -315,13 +275,13 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
 
 void RdmaCommunicator::Sync() {
 #ifdef DEBUG
-    std::cout << "RdmaCommunicator::Sync(): called." << std::endl;
+    std::cout << "RdmaCommunicator::Sync(): called.\n";
 #endif
 }
 
 void RdmaCommunicator::Close() {
 #ifdef DEBUG
-    std::cout << "RdmaCommunicator::Close(): called." << std::endl;
+    std::cout << "RdmaCommunicator::Close(): called.\n";
 #endif
     if (preregisteredMr) { ibv_dereg_mr(preregisteredMr); preregisteredMr = nullptr; }
     if (memoryRegion)    { ibv_dereg_mr(memoryRegion);    memoryRegion    = nullptr; }
@@ -332,13 +292,12 @@ void RdmaCommunicator::Close() {
     }
 }
 
-// ---------- Factory (kept as-is) ----------------------------------------------
+// ---------- Factory function ---------------------------------------------------
 
 extern "C" std::shared_ptr<RdmaCommunicator> create_communicator(std::shared_ptr<gvirtus::communicators::Endpoint> end) {
     std::string hostname = std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Rdma>(end)->address();
-    std::string port     = std::to_string(std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Rdma>(end)->port());
+    std::string port = std::to_string(std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Rdma>(end)->port());
 
-    // Determine if this is a RoCE endpoint
     bool isRoce = std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Rdma>(end)->suite() == "roce-rdma";
 
     return std::make_shared<RdmaCommunicator>(hostname, port, isRoce);
