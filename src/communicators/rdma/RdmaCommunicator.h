@@ -33,7 +33,7 @@ namespace gvirtus::communicators {
 
         char hostname[256]{};
         char port[6]{}; // 5 digits + '\0'
-
+        uint32_t inline_max_ = 0;
         ibv_wc workCompletion{};   // CQ poll scratch
 
         // Legacy scratch MR pointer (kept for compatibility; not used on pool path)
@@ -75,7 +75,8 @@ namespace gvirtus::communicators {
         // Allocate & register pools (called after QP is ready)
         void init_pools_();
         void destroy_pools_();
-
+        void cache_inline_cap_();
+        
     public:
         RdmaCommunicator() = default;
         RdmaCommunicator(const std::string& hostname, const std::string& port);

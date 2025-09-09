@@ -8,6 +8,8 @@
 #include <cstdlib>     // posix_memalign/free
 #include <arpa/inet.h>
 #include <stdexcept>
+#include <cerrno>      // NEW: for errno in logs
+#include <algorithm>   // NEW: for std::min
 
 #include "RdmaCommunicator.h"
 
@@ -18,6 +20,35 @@
 using gvirtus::communicators::RdmaCommunicator;
 
 // ---------- Helper ------------------------------------------------------------
+
+// NEW: query once and cache QP inline capability
+void RdmaCommunicator::cache_inline_cap_() {
+    inline_max_ = 0;
+    if (!rdmaCmId || !rdmaCmId->qp) {
+#ifdef DEBUG
+        std::cerr << "cache_inline_cap_: rdmaCmId/qp not ready.\n";
+#endif
+        inline_enabled = false;
+        return;
+    }
+    ibv_qp_attr attr{};
+    ibv_qp_init_attr init{};
+    int rc = ibv_query_qp(rdmaCmId->qp, &attr, IBV_QP_CAP, &init);
+    if (rc == 0) {
+        inline_max_ = attr.cap.max_inline_data;
+    } else {
+#ifdef DEBUG
+        std::cerr << "ibv_query_qp(IBV_QP_CAP) failed, rc=" << rc
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")\n";
+#endif
+        inline_max_ = 0;
+    }
+    inline_enabled = (inline_max_ > 0);
+#ifdef DEBUG
+    std::cout << "Cached QP inline cap = " << inline_max_ << " bytes, inline_enabled="
+              << inline_enabled << "\n";
+#endif
+}
 
 void RdmaCommunicator::request_min_rnr_timer_(uint8_t v) {
     if (!rdmaCmId || !rdmaCmId->qp) return;
@@ -114,6 +145,7 @@ RdmaCommunicator::RdmaCommunicator(const std::string& hostname, const std::strin
     memoryRegion = nullptr;
     preregisteredMr = nullptr;
     inline_enabled = true;
+    inline_max_ = 0; // NEW: init
 
     tx_pool_ = rx_pool_ = nullptr;
     tx_mr_ = rx_mr_ = nullptr;
@@ -129,9 +161,11 @@ RdmaCommunicator::RdmaCommunicator(rdma_cm_id *rdmaCmId)
     if (!rdmaCmId || !rdmaCmId->qp) throw std::runtime_error("Accepted rdma_cm_id is null or has no QP");
     this->rdmaCmId = rdmaCmId;
 
+    // Cache inline capability once (server side)
+    cache_inline_cap_(); // NEW
+
     // Pre-register small bounce buffer
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
-    inline_enabled = true;
 
     // Init TX/RX pools (64MB each)
     init_pools_();
@@ -204,7 +238,7 @@ const gvirtus::communicators::Communicator *const RdmaCommunicator::Accept() con
         std::free(ibvQpAttr);
     }
 
-    // New communicator will init pools & small MR
+    // New communicator will cache inline cap & init pools
     return new RdmaCommunicator(clientRdmaCmId);
 }
 
@@ -238,9 +272,11 @@ void RdmaCommunicator::Connect() {
 
     request_min_rnr_timer_(1);
 
+    // Cache inline capability once (client side)
+    cache_inline_cap_(); // NEW
+
     // Pre-register the small bounce buffer once
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
-    inline_enabled = true;
 
     // Init TX/RX pools (64MB each)
     init_pools_();
@@ -283,11 +319,6 @@ size_t RdmaCommunicator::Read(char *buffer, size_t size) {
             ibv_dereg_mr(memoryRegion);
             memoryRegion = nullptr;
         } else {
-            size_t off = rx_head_ % kPoolSize;
-            // We don't rely on off here; we know what we reserved last time in pool_reserve_rx_ via rx_head_.
-            // Since Read() is synchronous, the reserved region is the last one; memcpy from (rx_head_ % kPoolSize) before advance.
-            // But we stored 'off' only locally; recompute like we do in pool_reserve_rx_: we advanced rx_head_ only after memcpy below.
-            // Better approach: compute source pointer as (rx_head_ % kPoolSize) before increment.
             size_t cur = rx_head_ % kPoolSize;
             char* src = rx_pool_ + cur;
             std::memcpy(buffer, src, size);
@@ -304,38 +335,44 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
     std::cout << "Called Write(const char *buffer, size_t size) - Size: " << size << std::endl;
 #endif
 
-    // 1) Try INLINE if enabled and payload fits the magic threshold.
-    if (inline_enabled && size <= kInlineMagicBytes) {
-        ibv_sge sge{};
-        if (size > 0) {
-            sge.addr   = reinterpret_cast<uintptr_t>(buffer);
-            sge.length = static_cast<uint32_t>(size);
-            sge.lkey   = 0; // ignored for INLINE
-        }
+    // 1) Try INLINE if enabled and payload fits the cached threshold (cap).
+    //    Use min(magic, inline_max_) so你仍可用100B“保守上限”限制CPU copy，但不会超过设备能力。
+    if (inline_enabled) {
+        size_t inline_threshold = std::min<size_t>(kInlineMagicBytes, inline_max_); // NEW
+        if (size <= inline_threshold) {
+            ibv_sge sge{};
+            if (size > 0) {
+                sge.addr   = reinterpret_cast<uintptr_t>(buffer);
+                sge.length = static_cast<uint32_t>(size);
+                sge.lkey   = 0; // ignored for INLINE
+            }
 
-        ibv_send_wr wr{};
-        wr.wr_id      = 0;
-        wr.next       = nullptr;
-        wr.sg_list    = (size > 0) ? &sge : nullptr;
-        wr.num_sge    = (size > 0) ? 1 : 0;
-        wr.opcode     = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED | ((size > 0) ? IBV_SEND_INLINE : 0);
+            ibv_send_wr wr{};
+            wr.wr_id      = 0;
+            wr.next       = nullptr;
+            wr.sg_list    = (size > 0) ? &sge : nullptr;
+            wr.num_sge    = (size > 0) ? 1 : 0;
+            wr.opcode     = IBV_WR_SEND;
+            wr.send_flags = IBV_SEND_SIGNALED | ((size > 0) ? IBV_SEND_INLINE : 0);
 
-        ibv_send_wr *bad = nullptr;
-        int rc = ibv_post_send(rdmaCmId->qp, &wr, &bad);
-        if (rc == 0) {
-            int num_comp;
-            do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
-            if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, inline) failed");
-            if (workCompletion.status != IBV_WC_SUCCESS)
-                throw std::runtime_error(std::string("SEND (inline) failed status ") + ibv_wc_status_str(workCompletion.status));
-            return size;
-        } else {
+            ibv_send_wr *bad = nullptr;
+            int rc = ibv_post_send(rdmaCmId->qp, &wr, &bad);
+            if (rc == 0) {
+                int num_comp;
+                do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
+                if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, inline) failed");
+                if (workCompletion.status != IBV_WC_SUCCESS)
+                    throw std::runtime_error(std::string("SEND (inline) failed status ") + ibv_wc_status_str(workCompletion.status));
+                return size;
+            } else {
 #ifdef DEBUG
-            std::cerr << "INLINE post rejected (rc=" << rc << "). Disabling inline path.\n";
+                std::cerr << "INLINE post failed (rc=" << rc << ", errno=" << errno
+                          << " " << std::strerror(errno)
+                          << "). Falling back to non-inline for this send only.\n";
 #endif
-            inline_enabled = false;
-            // fall through
+                // 注意：不要关闭 inline_enabled，可能是瞬时资源问题。
+                // 直接跌落到非-inline路径处理本次发送。
+            }
         }
     }
 
