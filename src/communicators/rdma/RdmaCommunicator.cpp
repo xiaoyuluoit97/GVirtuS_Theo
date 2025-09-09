@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 #include <cstring>
+#include <cstdlib>     // posix_memalign/free
 #include <arpa/inet.h>
 #include <stdexcept>
 
@@ -27,6 +28,65 @@ void RdmaCommunicator::request_min_rnr_timer_(uint8_t v) {
         std::perror("ibv_modify_qp(IBV_QP_MIN_RNR_TIMER)");
 #endif
     }
+}
+
+inline char* RdmaCommunicator::pool_reserve_tx_(size_t size, size_t &off) {
+    if (size > kPoolSize || !tx_pool_) return nullptr;
+    size_t cur = tx_head_ % kPoolSize;
+    if (cur + size > kPoolSize) {
+        // wrap
+        cur = 0;
+        tx_head_ = (tx_head_ / kPoolSize + 1) * kPoolSize;
+    }
+    off = cur;
+    return tx_pool_ + cur;
+}
+
+inline char* RdmaCommunicator::pool_reserve_rx_(size_t size, size_t &off) {
+    if (size > kPoolSize || !rx_pool_) return nullptr;
+    size_t cur = rx_head_ % kPoolSize;
+    if (cur + size > kPoolSize) {
+        // wrap
+        cur = 0;
+        rx_head_ = (rx_head_ / kPoolSize + 1) * kPoolSize;
+    }
+    off = cur;
+    return rx_pool_ + cur;
+}
+
+void RdmaCommunicator::init_pools_() {
+    // Already initialized?
+    if (tx_pool_ || rx_pool_) return;
+    // Allocate page-aligned memory
+    void* p = nullptr;
+    if (posix_memalign(&p, kPoolAlign, kPoolSize) != 0) {
+        throw std::runtime_error("posix_memalign(tx_pool) failed");
+    }
+    tx_pool_ = static_cast<char*>(p);
+    tx_mr_ = ktm_rdma_reg_msgs(rdmaCmId, tx_pool_, kPoolSize);
+
+    p = nullptr;
+    if (posix_memalign(&p, kPoolAlign, kPoolSize) != 0) {
+        throw std::runtime_error("posix_memalign(rx_pool) failed");
+    }
+    rx_pool_ = static_cast<char*>(p);
+    rx_mr_ = ktm_rdma_reg_msgs(rdmaCmId, rx_pool_, kPoolSize);
+
+    tx_head_ = 0;
+    rx_head_ = 0;
+
+#ifdef DEBUG
+    std::cout << "Initialized TX/RX pools: 64MB each, lkeys {"
+              << (tx_mr_ ? tx_mr_->lkey : 0) << ", "
+              << (rx_mr_ ? rx_mr_->lkey : 0) << "}\n";
+#endif
+}
+
+void RdmaCommunicator::destroy_pools_() {
+    if (tx_mr_) { ibv_dereg_mr(tx_mr_); tx_mr_ = nullptr; }
+    if (tx_pool_) { std::free(tx_pool_); tx_pool_ = nullptr; }
+    if (rx_mr_) { ibv_dereg_mr(rx_mr_); rx_mr_ = nullptr; }
+    if (rx_pool_) { std::free(rx_pool_); rx_pool_ = nullptr; }
 }
 
 // ---------- Constructors / Destructor -----------------------------------------
@@ -54,6 +114,10 @@ RdmaCommunicator::RdmaCommunicator(const std::string& hostname, const std::strin
     memoryRegion = nullptr;
     preregisteredMr = nullptr;
     inline_enabled = true;
+
+    tx_pool_ = rx_pool_ = nullptr;
+    tx_mr_ = rx_mr_ = nullptr;
+    tx_head_ = rx_head_ = 0;
 }
 
 // Constructor used on the server side when a connection is accepted
@@ -67,13 +131,18 @@ RdmaCommunicator::RdmaCommunicator(rdma_cm_id *rdmaCmId)
 
     // Pre-register small bounce buffer
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
-    inline_enabled = true; // optimistic: we requested inline capability at QP creation
+    inline_enabled = true;
+
+    // Init TX/RX pools (64MB each)
+    init_pools_();
 }
 
 RdmaCommunicator::~RdmaCommunicator() {
 #ifdef DEBUG
     std::cout << "Called ~RdmaCommunicator()\n";
 #endif
+    destroy_pools_();
+
     if (preregisteredMr) { ibv_dereg_mr(preregisteredMr); preregisteredMr = nullptr; }
     if (memoryRegion)    { ibv_dereg_mr(memoryRegion);    memoryRegion    = nullptr; }
     if (rdmaCmId) {
@@ -106,7 +175,7 @@ void RdmaCommunicator::Serve() {
     qpInitAttr.cap.max_recv_wr      = 256;
     qpInitAttr.cap.max_send_sge     = 4;
     qpInitAttr.cap.max_recv_sge     = 4;
-    qpInitAttr.cap.max_inline_data  = 120; // request some inline capability (cheap, control-path)
+    qpInitAttr.cap.max_inline_data  = 120; // request some inline capability
     qpInitAttr.sq_sig_all           = 1;
     qpInitAttr.qp_type              = IBV_QPT_RC;
 
@@ -135,6 +204,7 @@ const gvirtus::communicators::Communicator *const RdmaCommunicator::Accept() con
         std::free(ibvQpAttr);
     }
 
+    // New communicator will init pools & small MR
     return new RdmaCommunicator(clientRdmaCmId);
 }
 
@@ -157,7 +227,7 @@ void RdmaCommunicator::Connect() {
     qpInitAttr.cap.max_recv_wr      = 256;
     qpInitAttr.cap.max_send_sge     = 4;
     qpInitAttr.cap.max_recv_sge     = 4;
-    qpInitAttr.cap.max_inline_data  = 120; // request inline capability; we won't query the actual limit
+    qpInitAttr.cap.max_inline_data  = 120; // request inline capability
     qpInitAttr.sq_sig_all           = 1;
     qpInitAttr.qp_type              = IBV_QPT_RC;
 
@@ -170,7 +240,10 @@ void RdmaCommunicator::Connect() {
 
     // Pre-register the small bounce buffer once
     preregisteredMr = ktm_rdma_reg_msgs(rdmaCmId, preregisteredBuffer, kSmallThreshold);
-    inline_enabled = true; // optimistic enabling; will auto-disable on first failure
+    inline_enabled = true;
+
+    // Init TX/RX pools (64MB each)
+    init_pools_();
 }
 
 // ---------- Data plane ---------------------------------------------------------
@@ -180,13 +253,20 @@ size_t RdmaCommunicator::Read(char *buffer, size_t size) {
     std::cout << "Called Read(char *buffer, size_t size) - Size: " << size << std::endl;
 #endif
 
-    bool used_temp_mr = false;
     if (size < kSmallThreshold) {
+        // Use small preregistered bounce buffer
         ktm_rdma_post_recv(rdmaCmId, nullptr, preregisteredBuffer, size, preregisteredMr);
     } else {
-        memoryRegion = ktm_rdma_reg_msgs(rdmaCmId, buffer, size);
-        used_temp_mr = true;
-        ktm_rdma_post_recv(rdmaCmId, nullptr, buffer, size, memoryRegion);
+        // Use RX pool (no per-call reg/dereg)
+        size_t off = 0;
+        char* dst = pool_reserve_rx_(size, off);
+        if (!dst) {
+            // Fallback: extremely large read (>64MB) — old path (register user buffer just for this call)
+            memoryRegion = ktm_rdma_reg_msgs(rdmaCmId, buffer, size);
+            ktm_rdma_post_recv(rdmaCmId, nullptr, buffer, size, memoryRegion);
+        } else {
+            ktm_rdma_post_recv(rdmaCmId, nullptr, dst, size, rx_mr_);
+        }
     }
 
     int num_comp;
@@ -197,9 +277,23 @@ size_t RdmaCommunicator::Read(char *buffer, size_t size) {
 
     if (size < kSmallThreshold) {
         std::memcpy(buffer, preregisteredBuffer, size);
-    } else if (used_temp_mr) {
-        ibv_dereg_mr(memoryRegion);
-        memoryRegion = nullptr;
+    } else {
+        // If we used pool, copy from pool to user; else (fallback) dereg MR.
+        if (memoryRegion) {
+            ibv_dereg_mr(memoryRegion);
+            memoryRegion = nullptr;
+        } else {
+            size_t off = rx_head_ % kPoolSize;
+            // We don't rely on off here; we know what we reserved last time in pool_reserve_rx_ via rx_head_.
+            // Since Read() is synchronous, the reserved region is the last one; memcpy from (rx_head_ % kPoolSize) before advance.
+            // But we stored 'off' only locally; recompute like we do in pool_reserve_rx_: we advanced rx_head_ only after memcpy below.
+            // Better approach: compute source pointer as (rx_head_ % kPoolSize) before increment.
+            size_t cur = rx_head_ % kPoolSize;
+            char* src = rx_pool_ + cur;
+            std::memcpy(buffer, src, size);
+            // Advance ring head
+            rx_head_ += size;
+        }
     }
 
     return size;
@@ -237,17 +331,17 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
                 throw std::runtime_error(std::string("SEND (inline) failed status ") + ibv_wc_status_str(workCompletion.status));
             return size;
         } else {
-            // Provider rejected INLINE (e.g., no support or too small limit) — permanently disable and fall through.
 #ifdef DEBUG
             std::cerr << "INLINE post rejected (rc=" << rc << "). Disabling inline path.\n";
 #endif
             inline_enabled = false;
-            // fall through to non-inline path for this send
+            // fall through
         }
     }
 
-    // 2) Non-inline paths: preregistered bounce buffer for small, register-on-the-fly for large.
+    // 2) Non-inline paths.
     if (size < kSmallThreshold) {
+        // Small non-inline: use preregistered bounce
         std::memcpy(preregisteredBuffer, buffer, size);
         ktm_rdma_post_send(rdmaCmId, nullptr, preregisteredBuffer, size, preregisteredMr, IBV_SEND_SIGNALED);
 
@@ -258,17 +352,53 @@ size_t RdmaCommunicator::Write(const char *buffer, size_t size) {
             throw std::runtime_error(std::string("SEND (small) failed status ") + ibv_wc_status_str(workCompletion.status));
         return size;
     } else {
-        ibv_mr *mr = ktm_rdma_reg_msgs(rdmaCmId, const_cast<char*>(buffer), size);
-        ktm_rdma_post_send(rdmaCmId, nullptr, const_cast<char*>(buffer), size, mr, IBV_SEND_SIGNALED);
+        // Large: use TX pool (no reg/dereg)
+        size_t off = 0;
+        char* dst = pool_reserve_tx_(size, off);
+        if (!dst) {
+            // Extremely large (>64MB): fallback old path (register caller buffer once)
+            ibv_mr *mr = ktm_rdma_reg_msgs(rdmaCmId, const_cast<char*>(buffer), size);
+            ktm_rdma_post_send(rdmaCmId, nullptr, const_cast<char*>(buffer), size, mr, IBV_SEND_SIGNALED);
+
+            int num_comp;
+            do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
+            if (num_comp < 0) { ibv_dereg_mr(mr); throw std::runtime_error("ibv_poll_cq(send, large-fallback) failed"); }
+            if (workCompletion.status != IBV_WC_SUCCESS) {
+                ibv_dereg_mr(mr);
+                throw std::runtime_error(std::string("SEND (large-fallback) failed status ") + ibv_wc_status_str(workCompletion.status));
+            }
+            ibv_dereg_mr(mr);
+            return size;
+        }
+
+        // Copy to TX pool and post
+        std::memcpy(dst, buffer, size);
+
+        ibv_sge sge{};
+        sge.addr   = reinterpret_cast<uintptr_t>(dst);
+        sge.length = static_cast<uint32_t>(size);
+        sge.lkey   = tx_mr_->lkey;
+
+        ibv_send_wr wr{};
+        wr.wr_id      = 0;
+        wr.next       = nullptr;
+        wr.sg_list    = &sge;
+        wr.num_sge    = 1;
+        wr.opcode     = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
+
+        ibv_send_wr *bad = nullptr;
+        int rc = ibv_post_send(rdmaCmId->qp, &wr, &bad);
+        if (rc) throw std::runtime_error("ibv_post_send(tx_pool) rc=" + std::to_string(rc));
 
         int num_comp;
         do num_comp = ibv_poll_cq(rdmaCmId->send_cq, 1, &workCompletion); while (num_comp == 0);
-        if (num_comp < 0) { ibv_dereg_mr(mr); throw std::runtime_error("ibv_poll_cq(send, large) failed"); }
-        if (workCompletion.status != IBV_WC_SUCCESS) {
-            ibv_dereg_mr(mr);
-            throw std::runtime_error(std::string("SEND (large) failed status ") + ibv_wc_status_str(workCompletion.status));
-        }
-        ibv_dereg_mr(mr);
+        if (num_comp < 0) throw std::runtime_error("ibv_poll_cq(send, tx_pool) failed");
+        if (workCompletion.status != IBV_WC_SUCCESS)
+            throw std::runtime_error(std::string("SEND (tx_pool) failed status ") + ibv_wc_status_str(workCompletion.status));
+
+        // Advance ring head only after completion (同步 API，安全复用)
+        tx_head_ += size;
         return size;
     }
 }
@@ -283,6 +413,7 @@ void RdmaCommunicator::Close() {
 #ifdef DEBUG
     std::cout << "RdmaCommunicator::Close(): called.\n";
 #endif
+    destroy_pools_();
     if (preregisteredMr) { ibv_dereg_mr(preregisteredMr); preregisteredMr = nullptr; }
     if (memoryRegion)    { ibv_dereg_mr(memoryRegion);    memoryRegion    = nullptr; }
     if (rdmaCmId) {
