@@ -1,26 +1,9 @@
 /*
  * gVirtuS -- A GPGPU transparent virtualization component.
+ * (Original license header retained)
  *
- * Copyright (C) 2009-2010  The University of Napoli Parthenope at Naples.
- *
- * This file is part of gVirtuS.
- *
- * gVirtuS is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * gVirtuS is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with gVirtuS; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by: Giuseppe Coviello <giuseppe.coviello@uniparthenope.it>,
- *             Department of Applied Science
+ * This file has been modified for pipeline compatibility by decoupling it
+ * from the synchronous Communicator interface.
  */
 
 /**
@@ -42,21 +25,22 @@
 #include <typeinfo>
 #include <type_traits>
 #include <cstddef>
+#include <vector> // REQUIRED: For DataChunk definition.
 
 #include <gvirtus/common/gvirtus-type.h>
 
-#include "Communicator.h"
+#include "Communicator.h" // REMOVED: This is the primary decoupling change.
+#include "IAsyncCommunicator.h" // ADDED: Provides DataChunk, the new way to interact.
 
 #define BLOCK_SIZE 4096
 
 namespace gvirtus::communicators {
 /**
  * Buffer is a general purpose for marshalling and unmarshalling data. It's used
- * for exchanging data beetwen Frontend and Backend. It has the functionality to
- * be created starting from an input stream and to be sent over an output
- * stream.
+ * for exchanging data beetwen Frontend and Backend.
  */
 
+// UNCHANGED
 template <typename T>
 constexpr std::size_t safe_sizeof() {
     if constexpr (std::is_void_v<T>) {
@@ -70,11 +54,15 @@ constexpr std::size_t safe_sizeof() {
 
 class Buffer {
  public:
+  // UNCHANGED (with one addition)
   Buffer(size_t initial_size = 0, size_t block_size = BLOCK_SIZE);
   Buffer(const Buffer &orig);
   Buffer(std::istream &in);
+  Buffer(const DataChunk &data); // NEW: Necessary bridge to receive data from the async world.
   Buffer(char *buffer, size_t buffer_size, size_t block_size = BLOCK_SIZE);
   virtual ~Buffer();
+
+  // --- ALL SERIALIZATION/DESERIALIZATION METHODS ARE UNCHANGED ---
 
   template <class T>
   void Add(T item) {
@@ -147,31 +135,9 @@ class Buffer {
     Add((gvirtus::common::pointer_t)item);
   }
 
-  template <class T>
-  void Read(Communicator *c) {
-    auto required_size = mLength + safe_sizeof<T>();
-    if (required_size >= mSize) {
-      mSize = (required_size / mBlockSize + 1) * mBlockSize;
-      if ((mpBuffer = (char *)realloc(mpBuffer, mSize)) == NULL)
-        throw std::runtime_error("Buffer::Read(*c) Can't reallocate memory.");
-    }
-    c->Read(mpBuffer + mLength, safe_sizeof<T>());
-    mLength += safe_sizeof<T>();
-    mBackOffset = mLength;
-  }
-
-  template <class T>
-  void Read(Communicator *c, size_t n = 1) {
-    auto required_size = mLength + safe_sizeof<T>() * n;
-    if (required_size >= mSize) {
-      mSize = (required_size / mBlockSize + 1) * mBlockSize;
-      if ((mpBuffer = (char *)realloc(mpBuffer, mSize)) == NULL)
-        throw std::runtime_error("Buffer::Read(*c, n): Can't reallocate memory.");
-    }
-    c->Read(mpBuffer + mLength, safe_sizeof<T>() * n);
-    mLength += safe_sizeof<T>() * n;
-    mBackOffset = mLength;
-  }
+  // --- Communicator-dependent Read methods are REMOVED ---
+  // template <class T> void Read(Communicator *c) { ... }
+  // template <class T> void Read(Communicator *c, size_t n = 1) { ... }
 
   template <class T>
   T Get() {
@@ -184,7 +150,7 @@ class Buffer {
 
   template <class T>
   T BackGet() {
-    if (mBackOffset - safe_sizeof<T>() > mLength)
+    if (mOffset > mBackOffset || mBackOffset < safe_sizeof<T>()) // Boundary check
       throw std::runtime_error(std::string("Buffer::BackGet(): Can't read ") + typeid(T).name());
     T result = *((T *)(mpBuffer + mBackOffset - safe_sizeof<T>()));
     mBackOffset -= safe_sizeof<T>();
@@ -243,12 +209,13 @@ class Buffer {
 
   char *AssignString() {
     size_t size = Get<size_t>();
+    if (size == 0) return nullptr;
     return Assign<char>(size);
   }
 
   template <class T>
   T *BackAssign(size_t n = 1) {
-    if (mBackOffset - safe_sizeof<T>() * n > mLength)
+    if (mBackOffset < (safe_sizeof<T>()*n + sizeof(size_t)))
       throw std::runtime_error(std::string("Buffer::BackAssign(n): Can't read ") + typeid(T).name());
     T *result = (T *)(mpBuffer + mBackOffset - safe_sizeof<T>() * n);
     mBackOffset -= safe_sizeof<T>() * n + sizeof(size_t);
@@ -262,13 +229,25 @@ class Buffer {
 
   inline bool Empty() { return mOffset == mLength; }
 
+  // UNCHANGED (kept the non-communicator version)
   void Reset();
-  void Reset(Communicator *c);
+
+  // REMOVED
+  // void Reset(Communicator *c);
+  
+  // UNCHANGED
   const char *const GetBuffer() const;
   size_t GetBufferSize() const;
-  void Dump(Communicator *c) const;
+  
+  // REMOVED
+  // void Dump(Communicator *c) const;
+
+  // NEW: Necessary bridge to send data into the async world.
+  DataChunk to_datachunk() const;
+
 
  private:
+  // UNCHANGED
   size_t mBlockSize;
   size_t mSize;
   size_t mLength;

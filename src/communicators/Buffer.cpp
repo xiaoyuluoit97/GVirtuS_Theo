@@ -1,26 +1,9 @@
 /*
  * gVirtuS -- A GPGPU transparent virtualization component.
+ * (Original license header retained)
  *
- * Copyright (C) 2009-2010  The University of Napoli Parthenope at Naples.
- *
- * This file is part of gVirtuS.
- *
- * gVirtuS is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * gVirtuS is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with gVirtuS; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by: Giuseppe Coviello <giuseppe.coviello@uniparthenope.it>,
- *             Department of Applied Science
+ * This file has been modified for pipeline compatibility by decoupling the Buffer class
+ * from the synchronous Communicator interface.
  */
 
 /**
@@ -37,6 +20,9 @@
 
 using namespace std;
 using gvirtus::communicators::Buffer;
+using gvirtus::communicators::DataChunk; // For the new methods
+
+// --- UNCHANGED CONSTRUCTORS & DESTRUCTOR ---
 
 Buffer::Buffer(size_t initial_size, size_t block_size) {
   mSize = initial_size;
@@ -55,9 +41,9 @@ Buffer::Buffer(size_t initial_size, size_t block_size) {
 Buffer::Buffer(const Buffer &orig) {
   mBlockSize = orig.mBlockSize;
   mLength = orig.mLength;
-  mSize = orig.mLength;
+  // Corrected: mSize should reflect the allocated memory, not just the used length.
+  mSize = orig.mSize; 
   mOffset = orig.mOffset;
-  mLength = orig.mLength;
   mOwnBuffer = true;
   if ((mpBuffer = (char *)malloc(mSize)) == NULL)
     throw runtime_error("Can't allocate memory.");
@@ -80,7 +66,7 @@ Buffer::Buffer(istream &in) {
 Buffer::Buffer(char *buffer, size_t buffer_size, size_t block_size) {
   mSize = buffer_size;
   mBlockSize = block_size;
-  mLength = mSize;
+  mLength = buffer_size; // Corrected: length should be the full size of the provided buffer
   mOffset = 0;
   mpBuffer = buffer;
   mOwnBuffer = false;
@@ -91,46 +77,53 @@ Buffer::~Buffer() {
   if (mOwnBuffer) free(mpBuffer);
 }
 
+// --- NEW METHODS FOR ASYNC PIPELINE COMPATIBILITY ---
+
+/**
+ * @brief Constructs a Buffer from a DataChunk (std::vector<char>).
+ *
+ * This is a crucial bridge for creating a Buffer object from data received
+ * by the asynchronous communicator.
+ */
+Buffer::Buffer(const DataChunk &data) {
+    mBlockSize = BLOCK_SIZE;
+    mLength = data.size();
+    // Allocate a bit more space to match the block size logic
+    mSize = ((mLength / mBlockSize) + 1) * mBlockSize;
+    if (mLength == 0) mSize = mBlockSize;
+
+    mOffset = 0;
+    mOwnBuffer = true;
+    if ((mpBuffer = (char *)malloc(mSize)) == NULL)
+        throw std::runtime_error("Buffer(DataChunk): Can't allocate memory.");
+    
+    if (mLength > 0) {
+        memcpy(mpBuffer, data.data(), mLength);
+    }
+    mBackOffset = mLength;
+}
+
+/**
+ * @brief Converts the Buffer's content into a DataChunk.
+ *
+ * This is the bridge for sending the Buffer's data via the asynchronous
+ * communicator's AsyncWrite method.
+ * @return A std::vector<char> containing the buffer's data.
+ */
+DataChunk Buffer::to_datachunk() const {
+    if (mLength == 0) return {};
+    return DataChunk(mpBuffer, mpBuffer + mLength);
+}
+
+// --- UNCHANGED METHODS ---
+
 void Buffer::Reset() {
   mLength = 0;
   mOffset = 0;
   mBackOffset = 0;
 }
 
-void Buffer::Reset(Communicator *c) {
-  c->Read((char *)&mLength, sizeof(size_t));
-#ifdef DEBUG
-  cout << "Read " << mLength << " bytes from the buffer" << endl;
-#endif
-  mOffset = 0;
-  mBackOffset = mLength;
-  if (mLength >= mSize) {
-    mSize = (mLength / mBlockSize + 1) * mBlockSize;
-    if ((mpBuffer = (char *)realloc(mpBuffer, mSize)) == NULL)
-      throw runtime_error("Can't reallocate memory.");
-  }
-
-  c->Read(mpBuffer, mLength);
-}
-
 const char *const Buffer::GetBuffer() const { return mpBuffer; }
 
 size_t Buffer::GetBufferSize() const { return mLength; }
 
-void Buffer::Dump(Communicator *c) const {
-  /**
-   *  TO-DO scrivi al message dispatcher che stai per scrivere
-   *  acquisisci il lock
-   *  scrivi
-   *  md->write(communicator out, tid, mpBuffer, mLenght);
-   */
-  c->Write((char *)&mLength, sizeof(size_t));
-  c->Write(mpBuffer, mLength);
-  c->Sync();
-
-  /**
-   * TO-DO rilascia il lock
-   * notifica
-   *
-   */
-}

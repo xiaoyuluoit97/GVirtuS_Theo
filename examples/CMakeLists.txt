@@ -98,35 +98,35 @@ gvirtus_install_target(gvirtus-communicators)
 # ==                 COMMUNICATOR IMPLEMENTATIONS                        ==
 # =========================================================================
 
-# --- TCP COMMUNICATOR (HEAVILY MODIFIED) ---
-# This library is now the core of our new asynchronous TCP implementation.
+# --- TCP COMMUNICATOR PLUGIN (Final Corrected Version) ---
 add_library(gvirtus-communicators-tcp SHARED
-    # Original synchronous implementation (kept for reference, can be removed if fully replaced)
     src/communicators/tcp/TcpCommunicator.cpp
-    
-    # NEW: The core of our asynchronous pipeline
     src/communicators/tcp/EventLoop.cpp
     src/communicators/tcp/AsyncTcpCommunicator.cpp
     src/communicators/tcp/SyncAdapterCommunicator.cpp
 )
 
-# *** REVISED INCLUDE DIRECTORY LOGIC ***
-# Use CMAKE_CURRENT_SOURCE_DIR for a more reliable path.
-# Use PUBLIC to ensure the include path is visible where needed.
+# *** THIS IS THE FINAL AND MOST ROBUST CONFIGURATION ***
+# By making these include directories PUBLIC, we ensure that any file
+# including a header from this target (like AsyncTcpCommunicator.h) will also
+# have access to these paths, thus finding Endpoint.h and IAsyncCommunicator.h.
 target_include_directories(gvirtus-communicators-tcp
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include/gvirtus/communicators
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/communicators/tcp
+        # Provides IAsyncCommunicator.h, Endpoint.h, Endpoint_Tcp.h etc.
+        ${PROJECT_SOURCE_DIR}/include 
+
+        # Provides EventLoop.h etc. for the target's own sources
+        ${PROJECT_SOURCE_DIR}/src/communicators/tcp
 )
 
-# It now needs to link against pthreads for std::thread
 target_link_libraries(gvirtus-communicators-tcp 
-    PUBLIC # Use PUBLIC so targets linking this can also see gvirtus-communicators
+    PUBLIC # Make this PUBLIC so the dependency is transitive
         gvirtus-communicators
-        Threads::Threads # For std::thread, std::mutex, etc.
+    PRIVATE
+        Threads::Threads
 )
-gvirtus_install_target(gvirtus-communicators-tcp)
 
+gvirtus_install_target(gvirtus-communicators-tcp)
 # --- IB COMMUNICATOR (Unchanged) ---
 add_library(gvirtus-communicators-ib SHARED
     src/communicators/rdma/ktmrdma.cpp

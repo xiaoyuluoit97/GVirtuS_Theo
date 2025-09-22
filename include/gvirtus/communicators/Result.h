@@ -38,7 +38,8 @@
 #include <iostream>
 #include <memory>
 #include "Buffer.h"
-
+#include "Communicator.h" 
+#include "IAsyncCommunicator.h"
 namespace gvirtus::communicators {
 /**
  * Result is used to store the results of a CUDA Runtime routine.
@@ -52,7 +53,8 @@ class Result {
   int GetExitCode();
 
   void Dump(Communicator *c);
-
+  // NEW: The asynchronous dump method for the pipeline
+  void DumpAsync(std::shared_ptr<IAsyncCommunicator> c);
   void TimeTaken(double time_taken);
   double TimeTaken() const;
 

@@ -38,16 +38,27 @@ Backend::Backend(const fs::path &path) {
     if (_properties.endpoints() > 1) LOG4CPLUS_INFO(logger, "🛈  - Application serves on " << _properties.endpoints() << " several endpoint");
 
     try {
+// In Backend::Backend, inside the try-catch block
+
         for (int i = 0; i < _properties.endpoints(); i++) {
-            _children.push_back(
-                    std::make_unique<Process>(
-                            communicators::CommunicatorFactory::get_communicator(
-                                    communicators::EndpointFactory::get_endpoint(path),
+            // 1. Get the endpoint for this iteration AND STORE IT in a variable.
+            auto endpoint = communicators::EndpointFactory::get_endpoint(path, i); // Assuming this gets the i-th endpoint
+
+            // 2. Get the async communicator using the endpoint.
+            auto communicator = communicators::CommunicatorFactory::get_async_communicator(
+                                    endpoint, 
                                     _properties.secure()
-                            ),
-                            _properties.plugins().at(i)
-                    )
+                                )->obj_ptr();
+
+            // 3. Create the Process, now passing ALL THREE required arguments.
+            _children.push_back(
+                std::make_unique<Process>(
+                    communicator, // Argument 1: The IAsyncCommunicator
+                    endpoint,     // Argument 2: The Endpoint
+                    _properties.plugins().at(i) // Argument 3: The plugins
+                )
             );
+        }
         }
         /*
         for (int i = 0; i < _properties.endpoints(); i++) {
