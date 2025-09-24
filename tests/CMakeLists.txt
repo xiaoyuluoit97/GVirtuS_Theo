@@ -1,26 +1,27 @@
 # Written By: Theodoros Aslanidis <theodoros.aslanidis@ucdconnect.ie>,
 #             School of Computer Science, University College Dublin
+#
+# This file has been modified to correctly link test executables against
+# the refactored gVirtuS libraries and their dependencies.
 
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 
-# Find GoogleTest package (make sure it is installed or handled otherwise)
+# --- Find or Fetch GoogleTest (Unchanged) ---
 find_package(GTest QUIET)
 if (NOT GTest_FOUND)
     message(STATUS "GTest not found, fetching with FetchContent...")
     include(FetchContent)
     FetchContent_Declare(
-      googletest
+      googlestest
       URL https://github.com/google/googletest/releases/download/v1.17.0/googletest-1.17.0.tar.gz
     )
     FetchContent_MakeAvailable(googletest)
-    # After FetchContent_MakeAvailable, GTest targets become available, 
-    # but variables like GTest_INCLUDE_DIRS might not be set, so you may want to set them manually:
     set(GTEST_INCLUDE_DIRS ${googletest_SOURCE_DIR}/include)
     set(GTEST_LIBRARIES gtest gtest_main)
 endif()
 
-# Add your CUDA source files manually
+# --- Define Test Sources (Unchanged) ---
 set(TEST_SOURCES
     test_cudart.cu
     test_nvrtc.cu
@@ -33,11 +34,7 @@ set(TEST_SOURCES
     test_cusparse.cu
 )
 
-## Alternatively, you can use file(GLOB ...) to automatically find all .cu files in a directory
-# file(GLOB TEST_SOURCES "*.cu")
-# But this way you cannot control the order of tests, so if a test crashes the backend, all the others will be failed too.
-
-# Loop over source files and create separate targets
+# --- Create Test Executables in a Loop (Linking Section is MODIFIED) ---
 foreach(TEST_SRC ${TEST_SOURCES})
     get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
     add_executable(${TEST_NAME} ${TEST_SRC})
@@ -46,16 +43,34 @@ foreach(TEST_SRC ${TEST_SOURCES})
         CUDA_SEPARABLE_COMPILATION ON
     )
 
+    # Include directories for GTest (Unchanged)
     target_include_directories(${TEST_NAME} PRIVATE
         ${GTEST_INCLUDE_DIRS}
     )
 
+    # *** THIS IS THE FINAL, CORRECTED LINKING BLOCK FOR EACH TEST ***
     target_link_libraries(${TEST_NAME} PRIVATE
+        # GoogleTest Libraries
         GTest::GTest
         GTest::Main
-        cuda # This is cudaDr library
-        curand
+
+        # gVirtuS Core Libraries:
+        # The test directly uses the frontend.
+        gvirtus-frontend
+        # The frontend and its dependencies require the common library.
+        gvirtus-common
+        
+        # System-level Dependencies required by the gVirtuS stack:
+        # For logging functionality used throughout the libraries.
+        ${LIBLOG4CPLUS}
+        # For std::filesystem used in frontend, backend, etc.
+        stdc++fs
+        # For std::thread, mutex, etc. used in the new async pipeline.
+        Threads::Threads
+
+        # CUDA Libraries required by the specific test (as before):
         cudart
+        curand
         cublas
         cublasLt
         cufft
@@ -63,8 +78,9 @@ foreach(TEST_SRC ${TEST_SOURCES})
         cusolver
         cusparse
         nvrtc
+        cuda # For CUDA Driver API
     )
 
-    # Register the test with ctest
+    # Register the test with ctest (Unchanged)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()

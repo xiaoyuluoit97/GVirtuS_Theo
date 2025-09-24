@@ -1,4 +1,5 @@
 #include "AsyncTcpCommunicator.h"
+#include "SyncAdapterCommunicator.h"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -386,3 +387,39 @@ std::shared_ptr<AsyncTcpCommunicator> AsyncTcpCommunicator::CreateFromAcceptedSo
 }
 
 } // namespace gvirtus::communicators
+
+extern "C" {
+
+/**
+ * @brief Factory function for the new asynchronous interface.
+ * This is called by CommunicatorFactory::get_async_communicator.
+ */
+std::shared_ptr<gvirtus::communicators::IAsyncCommunicator> 
+create_async_communicator(std::shared_ptr<gvirtus::communicators::Endpoint> end) {
+    // We assume the endpoint is of the correct type.
+    auto tcp_endpoint = std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Tcp>(end);
+    if (!tcp_endpoint) {
+        throw std::runtime_error("Invalid endpoint type for AsyncTcpCommunicator");
+    }
+    return std::make_shared<gvirtus::communicators::AsyncTcpCommunicator>(tcp_endpoint);
+}
+
+/**
+ * @brief Factory function for the old synchronous interface.
+ * This is called by CommunicatorFactory::get_communicator and is crucial
+ * for backward compatibility (e.g., for the Frontend).
+ */
+std::shared_ptr<gvirtus::communicators::Communicator> 
+create_communicator(std::shared_ptr<gvirtus::communicators::Endpoint> end) {
+    // 1. Create the real async engine.
+    auto tcp_endpoint = std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Tcp>(end);
+    if (!tcp_endpoint) {
+        throw std::runtime_error("Invalid endpoint type for SyncAdapterCommunicator");
+    }
+    auto async_core = std::make_shared<gvirtus::communicators::AsyncTcpCommunicator>(tcp_endpoint);
+
+    // 2. Wrap it in our SyncAdapter to provide the old synchronous interface.
+    return std::make_shared<gvirtus::communicators::SyncAdapterCommunicator>(async_core, end);
+}
+
+} // extern "C"

@@ -27,6 +27,7 @@ using gvirtus::communicators::Buffer;
 using gvirtus::communicators::IAsyncCommunicator;
 using gvirtus::communicators::DataChunk;
 using gvirtus::communicators::Result;
+using gvirtus::communicators::Endpoint; // <-- *** ADD THIS LINE ***
 using gvirtus::backend::Handler; // Use Handler from the correct namespace
 
 using std::chrono::steady_clock;
@@ -188,24 +189,13 @@ private:
 // ==                      PROCESS CLASS IMPLEMENTATION                   ==
 // =========================================================================
 
-Process::Process(std::shared_ptr<IAsyncCommunicator> communicator, vector<string> &plugins) : Observable() {
-    logger = log4cplus::Logger::getInstance(LOG4CPLUS_TEXT("Process"));
-
-    log4cplus::LogLevel logLevel = log4cplus::INFO_LOG_LEVEL;
-    char *val = getenv("GVIRTUS_LOGLEVEL");
-    std::string logLevelString = (val == NULL ? "" : std::string(val));
-    if (!logLevelString.empty()) {
-        try {
-            logLevel = std::stoi(logLevelString);
-        } catch (...) { /* ignore parsing errors */ }
-    }
-    logger.setLogLevel(logLevel);
-
-    signal(SIGCHLD, SIG_IGN);
+Process::Process(std::shared_ptr<IAsyncCommunicator> communicator, std::shared_ptr<gvirtus::communicators::Endpoint> endpoint, vector<string> &plugins) : Observable() {
+    // We only store the parameters here. All heavy lifting is done in Start().
     m_listener = std::move(communicator);
     m_endpoint = std::move(endpoint);
-    
     mPlugins = plugins;
+    
+    // The logger will be initialized in Start().
 }
 
 std::string getGVirtuSHome() {
@@ -214,6 +204,16 @@ std::string getGVirtuSHome() {
 }
 
 void Process::Start() {
+    // *** CRITICAL FIX: Initialize logger AFTER fork(), inside the child process. ***
+    // This ensures the logger has a clean state and is not corrupted by the fork.
+    logger = log4cplus::Logger::getInstance(LOG4CPLUS_TEXT("Process"));
+    log4cplus::LogLevel logLevel = log4cplus::INFO_LOG_LEVEL;
+    char *val = getenv("GVIRTUS_LOGLEVEL");
+    std::string logLevelString = (val == NULL ? "" : std::string(val));
+    if (!logLevelString.empty()) try { logLevel = std::stoi(logLevelString); } catch(...) {}
+    logger.setLogLevel(logLevel);
+
+    // Now we can safely start logging.
     LOG4CPLUS_DEBUG(logger, "✓ - [Process " << getpid() << "] Process::Start() called for asynchronous model.");
 
     // Load Handlers (Plugins)

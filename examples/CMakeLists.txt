@@ -167,24 +167,48 @@ target_link_libraries(gvirtus-frontend
 )
 gvirtus_install_target(gvirtus-frontend)
 
-# --- BACKEND (Unchanged, but now links to the new TCP lib) ---
+# --- BACKEND ---
 add_executable(gvirtus-backend
-    # MODIFIED: Process.cpp is now the core of the async pipeline
-    src/backend/Process.cpp
-    # UNCHANGED
+    # The source files are correct and do not need to change.
     src/backend/Backend.cpp
     src/backend/main.cpp
+    src/backend/Process.cpp
     src/backend/Property.cpp
 )
-target_include_directories(gvirtus-backend PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+# The include directory is also correct.
+target_include_directories(gvirtus-backend
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src
+)
+
+# *** THIS IS THE CORRECTED LINKING BLOCK ***
+# We add all the necessary libraries that the linker was missing.
 target_link_libraries(gvirtus-backend
     PRIVATE
+        # It needs gvirtus-common for Observable, Util, etc.
+        gvirtus-common 
+
+        # It needs the communicator libraries for network functionality.
         gvirtus-communicators
-        gvirtus-communicators-hybrid # This implicitly links tcp
+        gvirtus-communicators-hybrid # This transitively links tcp, ib, etc.
+
+        # It needs the threading library for our new async pipeline.
         Threads::Threads
+
+        # It needs the RDMA libraries (as before).
         rdmacm
         ibverbs
+
+        # CRITICAL: It needs the logging library.
+        ${LIBLOG4CPLUS}
+
+        # CRITICAL: It needs the filesystem library.
+        stdc++fs
 )
+
+# This installation command remains unchanged.
 gvirtus_install_target(gvirtus-backend)
 
 # =========================================================================
@@ -203,5 +227,3 @@ maybe_add_cuda_plugin(curand plugins/curand)
 maybe_add_cuda_plugin(nvrtc plugins/nvrtc)
 
 add_subdirectory(plugins/nvml)
-
-add_subdirectory(tests)

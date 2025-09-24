@@ -59,7 +59,7 @@ class Process : public common::Observable {
   
   // _handlers will be loaded in Start() and passed to the WorkerThreadPool.
   std::vector<std::shared_ptr<common::LD_Lib<Handler>>> _handlers;
-  
+ 
   std::vector<std::string> mPlugins;
   log4cplus::Logger logger;
 
@@ -74,7 +74,7 @@ class Process : public common::Observable {
    * @brief The central thread-safe queue for incoming tasks.
    */
   std::shared_ptr<TaskQueue> m_task_queue;
-  
+  std::shared_ptr<communicators::Endpoint> m_endpoint; // <-- The missing member
   /**
    * @brief The pool of worker threads that execute tasks from the queue.
    */

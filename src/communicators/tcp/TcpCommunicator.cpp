@@ -258,12 +258,3 @@ void TcpCommunicator::InitializeStream() {
     mpOutput = new ostream(mpOutputBuf);
 }
 
-extern "C" std::shared_ptr <TcpCommunicator> create_communicator(
-        std::shared_ptr <gvirtus::communicators::Endpoint> end) {
-    std::string arg =
-            "tcp://" +
-            std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Tcp>(end) ->address() +
-            ":" +
-            std::to_string(std::dynamic_pointer_cast<gvirtus::communicators::Endpoint_Tcp>(end)->port());
-    return std::make_shared<TcpCommunicator>(arg);
-}
